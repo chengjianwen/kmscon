@@ -10,6 +10,8 @@ Website:
 == Requirements ==
 
   Kmscon requires the following software:
+    - libnanomsg: a socket library that provides several common communication patterns.
+        http://www.nanomsg.org/
     - libtsm: terminal emulator state machine
         http://www.freedesktop.org/wiki/Software/kmscon/libtsm/
     - libudev: providing input, video, etc. device hotplug support (>=v172)
