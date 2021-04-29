@@ -44,6 +44,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
+#include <sys/sysmacros.h>
 #include "eloop.h"
 #include "shl_dlist.h"
 #include "shl_log.h"

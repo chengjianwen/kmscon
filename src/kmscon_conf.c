@@ -134,6 +134,10 @@ static void print_help()
 		"\t                                  Close current session\n"
 		"\t    --grab-terminal-new <grab>  [<Ctrl><Logo>Return]\n"
 		"\t                                  Create new terminal session\n"
+		"\t    --active-cjk-input <grab>  [<Ctrl>Space]\n"
+		"\t                                  Active(Inactive) CJK input\n"
+		"\t    --active-control <grab>  [<Ctrl>Print]\n"
+		"\t                                  Active(Inactive) Controled by piserver\n"
 		"\n"
 		"Video Options:\n"
 		"\t    --drm                   [on]    Use DRM if available\n"
@@ -530,6 +534,12 @@ static struct conf_grab def_grab_session_close =
 static struct conf_grab def_grab_terminal_new =
 		CONF_SINGLE_GRAB(SHL_CONTROL_MASK | SHL_LOGO_MASK, XKB_KEY_Return);
 
+static struct conf_grab def_active_cjk_input =
+		CONF_SINGLE_GRAB(SHL_CONTROL_MASK, XKB_KEY_space);
+
+static struct conf_grab def_active_control =
+		CONF_SINGLE_GRAB(SHL_CONTROL_MASK, XKB_KEY_Print);
+
 int kmscon_conf_new(struct conf_ctx **out)
 {
 	struct conf_ctx *ctx;
@@ -591,6 +601,9 @@ int kmscon_conf_new(struct conf_ctx **out)
 		CONF_OPTION_GRAB(0, "grab-session-dummy", &conf->grab_session_dummy, &def_grab_session_dummy),
 		CONF_OPTION_GRAB(0, "grab-session-close", &conf->grab_session_close, &def_grab_session_close),
 		CONF_OPTION_GRAB(0, "grab-terminal-new", &conf->grab_terminal_new, &def_grab_terminal_new),
+		/* CJK input method Options */
+		CONF_OPTION_GRAB(0, "active-cjk-input", &conf->active_cjk_input, &def_active_cjk_input),
+		CONF_OPTION_GRAB(0, "active-control", &conf->active_control, &def_active_control),
 
 		/* Video Options */
 		CONF_OPTION_BOOL_FULL(0, "drm", aftercheck_drm, NULL, NULL, &conf->drm, true),

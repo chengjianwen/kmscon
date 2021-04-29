@@ -133,6 +133,12 @@ struct kmscon_conf_t {
 	/* terminal-new grab */
 	struct conf_grab *grab_terminal_new;
 
+	/* CJK input Options */
+	struct conf_grab *active_cjk_input;
+
+	/* Sharing Options */
+	struct conf_grab *active_control;
+
 	/* Video Options */
 	/* use DRM if available */
 	bool drm;

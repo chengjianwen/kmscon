@@ -63,6 +63,10 @@ PKG_CHECK_MODULES([DRM], [libdrm])
 AC_SUBST(DRM_CFLAGS)
 AC_SUBST(DRM_LIBS)
 
+PKG_CHECK_MODULES([NANOMSG], [nanomsg])
+AC_SUBST(NANOMSG_CFLAGS)
+AC_SUBST(NANOMSG_LIBS)
+
 #
 # pkg-config dependencies
 # This unconditionally checks for all dependencies even if they are disabled. We

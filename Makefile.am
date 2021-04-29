@@ -503,20 +503,27 @@ kmscon_SOURCES = \
 	src/kmscon_seat.c \
 	src/kmscon_conf.h \
 	src/kmscon_conf.c \
+	src/kmscon_utf8.h \
+	src/kmscon_utf8.c \
+	src/kmscon_im.h \
+	src/kmscon_im.c \
+	src/kmscon_pinyin.h \
 	src/kmscon_main.c
 nodist_kmscon_SOURCES =
 
 kmscon_CPPFLAGS = \
 	$(AM_CPPFLAGS) \
 	$(XKBCOMMON_CFLAGS) \
-	$(TSM_CFLAGS)
+	$(TSM_CFLAGS) \
+	$(NANOMSG_CFLAGS)
+
 kmscon_LDADD = \
 	$(XKBCOMMON_LIBS) \
 	$(TSM_LIBS) \
+	$(NANOMSG_LIBS) \
 	libeloop.la \
 	libuterm.la \
 	libshl.la \
-	-lpthread \
 	-ldl
 kmscon_LDFLAGS = \
 	$(AM_LDFLAGS) \

@@ -1,4 +1,4 @@
-/*
+/**
  * kmscon - Terminal
  *
  * Copyright (c) 2011-2012 David Herrmann <dh.herrmann@googlemail.com>
@@ -35,6 +35,9 @@
 #include <libtsm.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysinfo.h>
+#include <nanomsg/nn.h>
+#include <nanomsg/pair.h>
 #include "conf.h"
 #include "eloop.h"
 #include "kmscon_conf.h"
@@ -42,13 +45,22 @@
 #include "kmscon_terminal.h"
 #include "pty.h"
 #include "shl_dlist.h"
+#include "shl_array.h"
 #include "shl_log.h"
 #include "text.h"
 #include "uterm_input.h"
 #include "uterm_video.h"
+#include "kmscon_utf8.h"
+#include "kmscon_im.h"
+#include "kmscon_pinyin.h"
 
 #define LOG_SUBSYSTEM "terminal"
 
+#ifndef	EVDEV_KEYCODE_OFFSET
+#define	EVDEV_KEYCODE_OFFSET	8
+#endif
+
+#define	SPY_PORT	7788
 struct screen {
 	struct shl_dlist list;
 	struct kmscon_terminal *term;
@@ -82,7 +94,131 @@ struct kmscon_terminal {
 	struct kmscon_font_attr font_attr;
 	struct kmscon_font *font;
 	struct kmscon_font *bold_font;
+
+/*
+ *  输入法及输入法状态
+ */
+	struct im *im;
+/*
+ *  远程控制
+ */
+	struct ev_fd *fd;
+	int nn_sock;
+        int controled;
+/*
+ * 心跳
+ */
+	struct ev_timer *putong;
 };
+
+struct tsm_cell {
+    uint32_t ch;
+    struct   tsm_screen_attr attr;
+};
+
+static int control_cb (struct tsm_screen *con,
+		uint32_t id,
+		const uint32_t *ch,
+		size_t len,
+		unsigned int width,
+		unsigned int posx,
+		unsigned int posy,
+		const struct tsm_screen_attr *attr,
+		tsm_age_t age,
+		void *data)
+{
+	int cols = tsm_screen_get_width (con);
+	struct tsm_cell *cells = data;
+	memcpy (&cells[posx + posy * cols].ch, ch, sizeof (uint32_t) );
+	memcpy (&cells[posx + posy * cols].attr, attr, sizeof (struct tsm_screen_attr) );
+	return 0;
+}
+
+static void control_event (void *data)
+{
+	struct	kmscon_terminal *term = data;
+
+	void *cells, *msg;
+	
+	int cols = tsm_screen_get_width (term->console);
+        int lines = tsm_screen_get_height (term->console);
+        int pos_x = tsm_screen_get_cursor_x (term->console);
+        int pos_y = tsm_screen_get_cursor_y (term->console);
+	int size = cols * lines * sizeof (struct tsm_cell);
+        /*
+         * 获取并发送屏幕内容
+         */
+        msg = nn_allocmsg(100 + size, 0);
+        sprintf (msg, "screen_on %d %d %d %d\n\n", cols, lines, pos_x, pos_y);
+        cells = strstr((char *)msg, "\n\n") + 2;
+	tsm_screen_draw (term->console, control_cb, cells);
+
+	nn_send (term->nn_sock, &msg, NN_MSG, NN_DONTWAIT);
+}
+
+int get_uptime()
+{
+	struct sysinfo  info;
+	sysinfo (&info);
+	return info.uptime;
+}
+
+void putong_callback (struct ev_timer *timer, long long unsigned num, void *data)
+{
+	struct kmscon_terminal	*term = data;
+
+	void *buf = nn_allocmsg(30, 0);
+	sprintf (buf, "putong\n\n%d", get_uptime()); // TODO: 是否可以通过num获取uptime?
+	nn_send (term->nn_sock, &buf, NN_MSG, NN_DONTWAIT);
+}
+
+void nn_callback (struct ev_fd *fd, int mask, void *data)
+{
+	struct kmscon_terminal	*term = data;
+	void *msg;
+	nn_recv (term->nn_sock, &msg, NN_MSG, NN_DONTWAIT);
+	if (strncmp (msg, "screen_on", strlen("screen_on")) == 0) {
+                term->controled = 1;
+                control_event (data);
+	} else if (strncmp (msg, "screen_off", strlen("screen_off")) == 0) {
+                term->controled = 0;
+	} else if (strncmp (msg, "power_off", strlen("power_off")) == 0) {
+		system ("poweroff");
+	} else if (strncmp (msg, "reboot", strlen("reboot")) == 0) {
+		system ("reboot");
+	}
+	nn_freemsg (msg);
+}
+
+static void im_output_callback (const char *u8, size_t len, void *data)
+{
+	struct kmscon_terminal *term = data;
+	kmscon_pty_write(term->pty, u8, len);
+}
+
+static void ime_load_callback (struct shl_array *py)
+{
+	struct tsm_utf8_mach *mach;
+	tsm_utf8_mach_new (&mach);
+
+	for (int i = 0; i < PINYIN_SIZE; i++)
+	{
+		struct im_ime *d = malloc (sizeof(struct im_ime));
+		d->pre = pinyin[i][0];
+		shl_array_new (&d->cand, sizeof (uint32_t), 0);
+		tsm_utf8_mach_reset (mach);
+		for (int j = 0; j < strlen(pinyin[i][1]); j++)
+		{
+			if (tsm_utf8_mach_feed (mach, pinyin[i][1][j]) == TSM_UTF8_ACCEPT)
+			{
+				uint32_t ch = tsm_utf8_mach_get (mach);
+				shl_array_push (d->cand, &ch);
+			}
+		}
+		shl_array_push (py, d);
+	}
+	tsm_utf8_mach_free (mach);
+}
 
 static void do_clear_margins(struct screen *scr)
 {
@@ -111,6 +247,50 @@ static void do_clear_margins(struct screen *scr)
 				   sw, dh);
 }
 
+void im_preedit_draw_callback(struct im *_im, int index, uint32_t id, uint32_t *ch, size_t len, void *data)
+{
+	struct tsm_screen_attr attr;
+	attr.br = 255;
+	attr.bg = 255;
+	attr.bb = 255;
+	attr.fr = 0;
+	attr.fg = 0;
+	attr.fb = 0;
+	attr.bold = 0;
+	attr.underline = 0;
+	attr.protect = 0;
+	attr.blink = 0;
+	attr.inverse = 0;
+	struct kmscon_text	*txt = data;
+	unsigned int width = tsm_ucs4_get_width (*ch) * len;
+	kmscon_text_draw (txt, id, ch, len,
+			width, index, txt->rows - 1, &attr);
+}
+
+void im_candidates_draw_callback(struct im *_im, int index, uint32_t id, uint32_t *ch, size_t len, bool selected, void *data)
+{
+	struct tsm_screen_attr attr;
+	attr.br = 255;
+	attr.bg = 255;
+	attr.bb = 255;
+	attr.fr = 0;
+	attr.fg = 0;
+	attr.fb = 0;
+	attr.bold = 0;
+	attr.underline = 0;
+	attr.protect = 0;
+	attr.blink = 0;
+	attr.inverse = selected ? 1 : 0;
+	struct kmscon_text	*txt = data;
+	unsigned int width = tsm_ucs4_get_width (*ch);
+
+	kmscon_text_draw (txt, id, ch, len,
+			width, 10 + index * width, txt->rows - 1, &attr);
+	for (int i = 1; i < width; i++)
+		kmscon_text_draw (txt, 0, 0, 0,
+				0, 10 + index * width + i, txt->rows - 1, &attr);
+}
+
 static void do_redraw_screen(struct screen *scr)
 {
 	int ret;
@@ -123,6 +303,8 @@ static void do_redraw_screen(struct screen *scr)
 
 	kmscon_text_prepare(scr->txt);
 	tsm_screen_draw(scr->term->console, kmscon_text_draw_cb, scr->txt);
+	if (im_isactive( scr->term->im))
+		im_draw(scr->term->im, im_preedit_draw_callback, im_candidates_draw_callback, scr->txt->cols, scr->txt);
 	kmscon_text_render(scr->txt);
 
 	ret = uterm_display_swap(scr->disp, false);
@@ -157,6 +339,8 @@ static void redraw_all(struct kmscon_terminal *term)
 		scr = shl_dlist_entry(iter, struct screen, list);
 		redraw_screen(scr);
 	}
+	if (term->controled )
+		control_event (term);
 }
 
 static void redraw_all_test(struct kmscon_terminal *term)
@@ -221,7 +405,8 @@ static void terminal_resize(struct kmscon_terminal *term,
 	if (!term->min_cols || !term->min_rows)
 		return;
 
-	tsm_screen_resize(term->console, term->min_cols, term->min_rows);
+	tsm_screen_resize(term->console, term->min_cols, im_isactive(term->im) ? term->min_rows - 1: term->min_rows);
+
 	kmscon_pty_resize(term->pty, term->min_cols, term->min_rows);
 	redraw_all(term);
 }
@@ -457,6 +642,41 @@ static void input_event(struct uterm_input *input,
 	if (ev->num_syms > 1)
 		return;
 
+	if (conf_grab_matches(term->conf->active_control,
+			      ev->mods, ev->num_syms, ev->keysyms)) {
+                ev->handled = true;
+                if (term->controled)
+			term->controled = 0;
+                else
+			term->controled = 1;
+                return;
+        }
+	if (conf_grab_matches(term->conf->active_cjk_input,
+			      ev->mods, ev->num_syms, ev->keysyms)) {
+		ev->handled = true;
+		im_actived (term->im, !im_isactive(term->im));
+// 输入法的界面
+		if (im_isactive(term->im))
+			im_reset (term->im);
+		if (im_isactive(term->im))
+		{
+			tsm_screen_move_down (term->console, 1, true);
+			tsm_screen_scroll_down (term->console, 1);
+		}
+		terminal_resize(term, 0, 0, true, true);
+		redraw_all(term);
+		return;
+	}
+
+	if (im_isactive(term->im))
+		im_keyboard (term->im, ev->keycode - EVDEV_KEYCODE_OFFSET, im_output_callback, &ev->handled, term);
+
+	if (ev->handled)
+	{
+		redraw_all(term);
+		return;
+	}
+
 	if (tsm_vte_handle_keyboard(term->vte, ev->keysyms[0], ev->ascii,
 				    ev->mods, ev->codepoints[0])) {
 		tsm_screen_sb_reset(term->console);
@@ -516,10 +736,14 @@ static void terminal_destroy(struct kmscon_terminal *term)
 	kmscon_pty_unref(term->pty);
 	kmscon_font_unref(term->bold_font);
 	kmscon_font_unref(term->font);
+        im_destroy (term->im);
 	tsm_vte_unref(term->vte);
 	tsm_screen_unref(term->console);
 	uterm_input_unref(term->input);
+	nn_close(term->nn_sock);
+	ev_eloop_rm_fd(term->fd);
 	ev_eloop_unref(term->eloop);
+	im_destroy (term->im);
 	free(term);
 }
 
@@ -555,8 +779,7 @@ static int session_event(struct kmscon_session *session,
 	return 0;
 }
 
-static void pty_input(struct kmscon_pty *pty, const char *u8, size_t len,
-								void *data)
+static void pty_input(struct kmscon_pty *pty, const char *u8, size_t len, void *data)
 {
 	struct kmscon_terminal *term = data;
 
@@ -569,19 +792,19 @@ static void pty_input(struct kmscon_pty *pty, const char *u8, size_t len,
 	}
 }
 
-static void pty_event(struct ev_fd *fd, int mask, void *data)
-{
-	struct kmscon_terminal *term = data;
-
-	kmscon_pty_dispatch(term->pty);
-}
-
 static void write_event(struct tsm_vte *vte, const char *u8, size_t len,
 			void *data)
 {
 	struct kmscon_terminal *term = data;
 
 	kmscon_pty_write(term->pty, u8, len);
+}
+
+static void pty_event(struct ev_fd *fd, int mask, void *data)
+{
+	struct kmscon_terminal *term = data;
+
+	kmscon_pty_dispatch(term->pty);
 }
 
 int kmscon_terminal_register(struct kmscon_session **out,
@@ -621,6 +844,11 @@ int kmscon_terminal_register(struct kmscon_session **out,
 	if (ret)
 		goto err_con;
 	tsm_vte_set_palette(term->vte, term->conf->palette);
+
+	im_new(&term->im);
+	im_ime_load (term->im, ime_load_callback);
+
+	im_actived (term->im, 0);
 
 	ret = font_set(term);
 	if (ret)
@@ -673,9 +901,42 @@ int kmscon_terminal_register(struct kmscon_session **out,
 
 	ev_eloop_ref(term->eloop);
 	uterm_input_ref(term->input);
+
+	term->nn_sock = nn_socket (AF_SP, NN_PAIR);
+	if (term->nn_sock < 0)
+		goto err_uterm;
+        ret = nn_bind (term->nn_sock, "tcp://*:7788");
+	if (ret < 0)
+		goto err_socket;
+	int	fd;
+	size_t	sz = sizeof (fd);
+	ret = nn_getsockopt (term->nn_sock, NN_SOL_SOCKET, NN_RCVFD, &fd, &sz);
+	if (ret < 0)
+		goto err_socket;
+	ret = ev_eloop_new_fd (term->eloop, &term->fd, fd, EV_READABLE, nn_callback, term);
+	if (ret < 0)
+		goto err_socket;
+
+        term->controled = 1;
+
+        struct itimerspec spec;
+        spec.it_interval.tv_sec = 1;
+        spec.it_interval.tv_nsec = 0;
+        spec.it_value.tv_sec = 1;
+        spec.it_value.tv_nsec = 0;
+        ret = ev_eloop_new_timer(term->eloop, &term->putong,
+                        &spec, putong_callback,
+                        term);
+
 	*out = term->session;
 	log_debug("new terminal object %p", term);
 	return 0;
+
+err_socket:
+	nn_close (term->nn_sock);
+err_uterm:
+	ev_eloop_unref (term->eloop);
+	uterm_input_unref (term->input);
 
 err_input:
 	uterm_input_unregister_cb(term->input, input_event, term);
@@ -687,6 +948,7 @@ err_font:
 	kmscon_font_unref(term->bold_font);
 	kmscon_font_unref(term->font);
 err_vte:
+	im_destroy (term->im);
 	tsm_vte_unref(term->vte);
 err_con:
 	tsm_screen_unref(term->console);
